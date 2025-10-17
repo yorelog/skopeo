@@ -1,0 +1,223 @@
+name: Sync Images to Aliyun Registry
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_image:
+        description: '源镜像 (例如: nvidia/cuda:12.1.1-devel-ubuntu22.04)'
+        required: true
+        type: string
+      target_tag:
+        description: '目标标签 (例如: 12.1.1-devel-ubuntu22.04，留空则使用源镜像标签)'
+        required: false
+        type: string
+      target_namespace:
+        description: '目标命名空间'
+        required: false
+        default: 'yoce/cuda'
+        type: string
+
+env:
+  ALIYUN_REGISTRY: registry.cn-beijing.aliyuncs.com
+
+jobs:
+  sync-image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+    - name: Smart disk space cleanup
+      run: |
+        set -euo pipefail
+
+        echo "📊 轻量磁盘空间检测..."
+        df -h /
+        echo ""
+
+        FREE_MB=$(df -m / | tail -1 | awk '{print $4}')
+        THRESHOLD_MB=15360   # 约15GB，可根据需要调整
+
+        if [ "$FREE_MB" -gt "$THRESHOLD_MB" ]; then
+          FREE_GB=$(awk "BEGIN {printf \"%.1f\", $FREE_MB/1024}")
+          echo "✅ 当前根分区可用 ${FREE_GB}GB，超过阈值，跳过清理。"
+          exit 0
+        fi
+
+        echo "⚠️ 可用空间不足，执行精简清理..."
+        BEFORE_MB=$FREE_MB
+
+        shopt -s nullglob
+        CANDIDATES=(
+          /usr/share/swift
+          /usr/share/miniconda
+          /usr/share/az_*
+          /usr/share/gradle-*
+          /usr/share/dotnet
+          /opt/ghc
+          /usr/local/share/powershell
+          /opt/hostedtoolcache/CodeQL
+          /usr/local/lib/android
+        )
+
+        for pattern in "${CANDIDATES[@]}"; do
+          for target in $pattern; do
+            if [ -e "$target" ]; then
+              SIZE=$(sudo du -sh "$target" 2>/dev/null | cut -f1)
+              echo "🧹 删除 $target (约 $SIZE)..."
+              sudo rm -rf "$target"
+            fi
+          done
+        done
+        shopt -u nullglob
+
+        echo "🧹 清理临时目录..."
+        sudo rm -rf /tmp/* /var/tmp/* || true
+
+        AFTER_MB=$(df -m / | tail -1 | awk '{print $4}')
+        DIFF_MB=$((AFTER_MB - BEFORE_MB))
+
+        if [ "$DIFF_MB" -gt 0 ]; then
+          DIFF_GB=$(awk "BEGIN {printf \"%.2f\", $DIFF_MB/1024}")
+          echo "✅ 释放空间约 ${DIFF_GB}GB"
+        else
+          echo "ℹ️ 清理后可用空间变化不明显"
+        fi
+
+        echo "📊 当前根分区可用:"
+        df -h /
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Log in to Aliyun Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.ALIYUN_REGISTRY }}
+        username: ${{ secrets.ALIYUN_USERNAME }}
+        password: ${{ secrets.ALIYUN_PASSWORD }}
+    
+    - name: Parse image information
+      run: |
+        SOURCE_IMAGE="${{ inputs.source_image }}"
+        TARGET_NAMESPACE="${{ inputs.target_namespace || 'yoce/cuda' }}"
+        TARGET_TAG="${{ inputs.target_tag }}"
+        
+        # 如果没有指定目标标签，从源镜像提取
+        if [[ -z "$TARGET_TAG" ]]; then
+          if [[ "$SOURCE_IMAGE" == *":"* ]]; then
+            TARGET_TAG="${SOURCE_IMAGE##*:}"
+          else
+            TARGET_TAG="latest"
+          fi
+        fi
+        
+        TARGET_IMAGE="${{ env.ALIYUN_REGISTRY }}/${TARGET_NAMESPACE}:${TARGET_TAG}"
+        
+        # 设置环境变量
+        echo "SOURCE_IMAGE=$SOURCE_IMAGE" >> $GITHUB_ENV
+        echo "TARGET_IMAGE=$TARGET_IMAGE" >> $GITHUB_ENV
+        echo "TARGET_TAG=$TARGET_TAG" >> $GITHUB_ENV
+        
+        echo "🔄 同步镜像:"
+        echo "  源镜像: $SOURCE_IMAGE"
+        echo "  目标镜像: $TARGET_IMAGE"
+    
+    - name: Check disk space before pull
+      run: |
+        echo "📊 拉取前磁盘空间:"
+        df -h /
+        echo ""
+        echo "Docker空间使用:"
+        docker system df
+    
+    - name: Sync image to Aliyun Registry
+      run: |
+        echo "📥 拉取源镜像..."
+        # 设置Docker的并发拉取
+        export DOCKER_BUILDKIT=1
+        docker pull "$SOURCE_IMAGE"
+        
+        echo "📊 拉取后磁盘空间:"
+        df -h /
+        
+        # 检查是否需要清理空间
+        DISK_USAGE=$(df / | tail -1 | awk '{print $5}' | sed 's/%//')
+        if [ "$DISK_USAGE" -gt 80 ]; then
+          echo "⚠️ 磁盘使用率超过80%，执行紧急清理..."
+          docker system prune -f
+          sudo rm -rf /tmp/* /var/tmp/* || true
+        fi
+        
+        echo "🏷️ 标记镜像..."
+        docker tag "$SOURCE_IMAGE" "$TARGET_IMAGE"
+        
+        echo "📤 推送到阿里云镜像仓库..."
+        docker push "$TARGET_IMAGE"
+        
+        echo "✅ 同步完成!"
+        echo "镜像地址: $TARGET_IMAGE"
+  
+    
+    - name: List available remote tags
+      run: |
+        echo "🏷️ 查询远程镜像可用标签..."
+        echo "================================"
+        
+        # 提取镜像名称（去除tag部分）
+        SOURCE_REPO="${SOURCE_IMAGE%%:*}"
+        TARGET_REPO="${TARGET_IMAGE%%:*}"
+        
+        echo "📋 源镜像仓库可用标签 ($SOURCE_REPO):"
+        echo "-----------------------------------"
+        
+        # 尝试获取源镜像的tags（限制显示数量避免输出过多）
+
+        # 使用Docker Registry API v2获取tags
+        REPO_NAME=$(echo "$SOURCE_REPO" | cut -d'/' -f2-)
+        REGISTRY_URL="https://registry-1.docker.io"
+        
+        # 获取认证token
+        TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:$SOURCE_REPO:pull" | jq -r '.token' 2>/dev/null)
+        
+        if [[ "$TOKEN" != "null" && -n "$TOKEN" ]]; then
+          echo "获取最新的20个标签:"
+          curl -s -H "Authorization: Bearer $TOKEN" \
+            "$REGISTRY_URL/v2/$SOURCE_REPO/tags/list" | \
+            jq -r '.tags[]?' 2>/dev/null | head -20 || echo "无法解析标签列表"
+        else
+          echo "⚠️ 无法获取Docker Hub认证token，跳过源镜像标签查询"
+        fi
+        
+        
+        echo ""
+        echo "📋 阿里云镜像仓库当前标签 ($TARGET_REPO):"
+        echo "----------------------------------------"
+        
+        # 获取阿里云镜像仓库的标签
+        NAMESPACE=$(echo "$TARGET_REPO" | sed "s|${{ env.ALIYUN_REGISTRY }}/||" | cut -d'/' -f1)
+        REPO_NAME=$(echo "$TARGET_REPO" | sed "s|${{ env.ALIYUN_REGISTRY }}/$NAMESPACE/||")
+        
+        # 使用阿里云镜像服务API获取标签列表
+        echo "正在查询命名空间: $NAMESPACE"
+        echo "镜像仓库名称: $REPO_NAME"
+        echo "当前同步的标签: $TARGET_TAG"
+        
+        # 尝试使用docker命令查询现有标签
+        echo ""
+        echo "🔍 验证当前标签可用性:"
+        if docker manifest inspect "$TARGET_IMAGE" > /dev/null 2>&1; then
+          echo "✅ $TARGET_TAG - 刚刚同步成功"
+        else
+          echo "❌ $TARGET_TAG - 验证失败"
+        fi
+        
+        echo ""
+        echo "💡 使用建议:"
+        echo "============"
+        echo "拉取刚同步的镜像:"
+        echo "docker pull $TARGET_IMAGE"
+        echo ""
+        echo "查看更多标签请访问:"
+        echo "https://cr.console.aliyun.com/repository/cn-beijing/$NAMESPACE/$REPO_NAME/images"
