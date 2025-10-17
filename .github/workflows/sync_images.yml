@@ -124,38 +124,43 @@ jobs:
         echo "  源镜像: $SOURCE_IMAGE"
         echo "  目标镜像: $TARGET_IMAGE"
     
-    - name: Check disk space before pull
+    - name: Check disk space before sync
       run: |
-        echo "📊 拉取前磁盘空间:"
+        echo "📊 同步前磁盘空间:"
         df -h /
         echo ""
         echo "Docker空间使用:"
         docker system df
     
     - name: Sync image to Aliyun Registry
+      env:
+        ALIYUN_USERNAME: ${{ secrets.ALIYUN_USERNAME }}
+        ALIYUN_PASSWORD: ${{ secrets.ALIYUN_PASSWORD }}
       run: |
-        echo "📥 拉取源镜像..."
-        # 设置Docker的并发拉取
-        export DOCKER_BUILDKIT=1
-        docker pull "$SOURCE_IMAGE"
-        
-        echo "📊 拉取后磁盘空间:"
-        df -h /
-        
-        # 检查是否需要清理空间
-        DISK_USAGE=$(df / | tail -1 | awk '{print $5}' | sed 's/%//')
-        if [ "$DISK_USAGE" -gt 80 ]; then
-          echo "⚠️ 磁盘使用率超过80%，执行紧急清理..."
-          docker system prune -f
-          sudo rm -rf /tmp/* /var/tmp/* || true
+        set -euo pipefail
+
+        if [[ -z "${SOURCE_IMAGE:-}" || -z "${TARGET_IMAGE:-}" ]]; then
+          echo "❌ 缺少镜像信息" >&2
+          exit 1
         fi
-        
-        echo "🏷️ 标记镜像..."
-        docker tag "$SOURCE_IMAGE" "$TARGET_IMAGE"
-        
-        echo "📤 推送到阿里云镜像仓库..."
-        docker push "$TARGET_IMAGE"
-        
+
+        if [[ -z "${ALIYUN_USERNAME:-}" || -z "${ALIYUN_PASSWORD:-}" ]]; then
+          echo "❌ 缺少阿里云凭据" >&2
+          exit 1
+        fi
+
+        echo "📥 使用 Skopeo 同步镜像..."
+        docker run --rm \
+          quay.io/skopeo/stable:latest \
+          copy \
+          --all \
+          --dest-creds "${ALIYUN_USERNAME}:${ALIYUN_PASSWORD}" \
+          "docker://${SOURCE_IMAGE}" \
+          "docker://${TARGET_IMAGE}"
+
+        echo "� 同步后磁盘空间:"
+        df -h /
+
         echo "✅ 同步完成!"
         echo "镜像地址: $TARGET_IMAGE"
   
