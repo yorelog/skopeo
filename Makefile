@@ -29,7 +29,7 @@ SEQUOIA_SONAME_DIR =
 # N/B: This value is managed by Renovate, manual changes are
 # possible, as long as they don't disturb the formatting
 # (i.e. DO NOT ADD A 'v' prefix!)
-GOLANGCI_LINT_VERSION := 2.5.0
+GOLANGCI_LINT_VERSION := 2.6.2
 
 ifeq ($(GOBIN),)
 GOBIN := $(GOPATH)/bin
@@ -202,6 +202,10 @@ test-integration:
 
 
 # Helper target to set up SKOPEO_BINARY variable for local test targets
+# SKOPEO_BINARY only takes effect on `test-integration-local` and
+# `test-system-local` targets. It's not propagated into the container used for `test-integration` and
+# `test-system`. These targets will (build and) use skopeo binary at
+# ./bin/skopeo.
 .eval-skopeo-binary: $(if $(SKOPEO_BINARY),,bin/skopeo)
 	$(eval SKOPEO_BINARY := $(or $(SKOPEO_BINARY),./bin/skopeo))
 	@echo "Testing with $(SKOPEO_BINARY) ..."
@@ -226,7 +230,7 @@ test-system:
 # Primarily intended for CI.
 test-system-local: .eval-skopeo-binary
 	hack/warn-destructive-tests.sh
-	bats --tap systemtest
+	hack/test-system.sh
 
 test-unit:
 	# Just call (make test unit-local) here instead of worrying about environment differences
@@ -238,10 +242,13 @@ validate:
 # This target is only intended for development, e.g. executing it from an IDE. Use (make test) for CI or pre-release testing.
 test-all-local: validate-local validate-docs test-unit-local
 
+.PHONY: fmt
+fmt: tools
+	$(GOBIN)/golangci-lint fmt
+
 .PHONY: validate-local
 validate-local: tools
 	hack/validate-git-marks.sh
-	hack/validate-gofmt.sh
 	$(GOBIN)/golangci-lint run --build-tags "${BUILDTAGS}"
 	# An extra run with --tests=false allows detecting code unused outside of tests;
 	# ideally the linter should be able to find this automatically.
@@ -265,8 +272,3 @@ vendor:
 
 vendor-in-container:
 	podman run --privileged --rm --env HOME=/root -v $(CURDIR):/src -w /src golang $(MAKE) vendor
-
-# CAUTION: This is not a replacement for RPMs provided by your distro.
-# Only intended to build and test the latest unreleased changes.
-rpm:
-	rpkg local

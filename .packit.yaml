@@ -71,9 +71,6 @@ jobs:
   - job: copr_build
     trigger: commit
     packages: [skopeo-fedora]
-    notifications:
-      failure_comment:
-        message: "podman-next COPR build failed. @containers/packit-build please check."
     branch: main
     owner: rhcontainerbot
     project: podman-next
@@ -95,7 +92,8 @@ jobs:
 
   # Tests on ELN for main branch
   - job: tests
-    trigger: pull_request
+    # FIXME: https://github.com/containers/skopeo/issues/2748
+    trigger: ignore
     packages: [skopeo-eln]
     notifications: *test_failure_notification
     targets: *eln_copr_targets
